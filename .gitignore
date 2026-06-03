@@ -4,3 +4,6 @@ __pycache__/
 *.joblib
 data/raw/
 data/external/
+models/sentence_transformer_embeddings.npy
+models/*.npy
+# Large model files — regenerate with 05_recommendation_engine.ipynb
