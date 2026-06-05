@@ -43,7 +43,39 @@ def load_embeddings():
     path = MODELS / 'sentence_transformer_embeddings.npy'
     if path.exists():
         return np.load(str(path))
-    return None
+
+    # No existe — generamos en runtime
+    st.info("⚙️ Generating embeddings for the first time. This takes ~10 minutes...")
+
+    df = load_recommendation_index()
+
+    def build_text(row):
+        parts = []
+        for col in ['name', 'tagline', 'description']:
+            val = str(row.get(col, ''))
+            if val not in ('', 'nan', 'None'):
+                parts.append(val.strip())
+        return ' | '.join(parts)
+
+    texts = df.apply(build_text, axis=1).tolist()
+
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    embeddings = model.encode(
+        texts,
+        batch_size=256,
+        show_progress_bar=False,
+        normalize_embeddings=True
+    )
+
+    # Intentar guardar para futuras cargas
+    try:
+        MODELS.mkdir(parents=True, exist_ok=True)
+        np.save(str(path), embeddings)
+    except Exception:
+        pass
+
+    return embeddings
 
 @st.cache_resource
 def load_sentence_transformer():
