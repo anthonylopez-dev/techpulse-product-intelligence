@@ -19,6 +19,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from datetime import datetime
 import warnings
+import os
 
 warnings.filterwarnings('ignore')
 
@@ -170,9 +171,13 @@ _state = {
 }
 
 def get_state():
-    """Carga lazy de todos los recursos."""
+    """Carga lazy — usa índice lite en producción, completo en local."""
+    USE_LITE = os.getenv('USE_LITE_INDEX', 'false').lower() == 'true'
+
     if _state['df'] is None:
-        _state['df'] = pd.read_parquet(MODELS / 'recommendation_index.parquet')
+        idx_file = 'recommendation_index_lite.parquet' if USE_LITE \
+                   else 'recommendation_index.parquet'
+        _state['df'] = pd.read_parquet(MODELS / idx_file)
 
     if _state['trends'] is None:
         _state['trends'] = pd.read_parquet(PROCESSED / 'category_trends.parquet')
@@ -181,13 +186,15 @@ def get_state():
         _state['profiles'] = pd.read_parquet(PROCESSED / 'cluster_profiles.parquet')
 
     if _state['embeddings'] is None:
-        emb_path = MODELS / 'sentence_transformer_embeddings.npy'
+        emb_file = 'sentence_transformer_embeddings_lite.npy' if USE_LITE \
+                   else 'sentence_transformer_embeddings.npy'
+        emb_path = MODELS / emb_file
         if emb_path.exists():
             _state['embeddings'] = np.load(str(emb_path))
         else:
             raise HTTPException(
                 status_code=503,
-                detail="Embeddings not found. Run notebook 05 first."
+                detail="Embeddings not found. Run build_lite_index.py first."
             )
 
     if _state['model'] is None:
