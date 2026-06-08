@@ -45,7 +45,8 @@ def load_embeddings():
         return np.load(str(path))
 
     # No existe — generamos en runtime
-    st.info("⚙️ Generating embeddings for the first time. This takes ~10 minutes...")
+    placeholder = st.empty()
+    placeholder.info("⚙️ Generating embeddings for the first time. This takes ~10 minutes...")
 
     df = load_recommendation_index()
 
@@ -68,13 +69,13 @@ def load_embeddings():
         normalize_embeddings=True
     )
 
-    # Intentar guardar para futuras cargas
     try:
         MODELS.mkdir(parents=True, exist_ok=True)
         np.save(str(path), embeddings)
     except Exception:
         pass
 
+    placeholder.empty()  # ← limpia el mensaje al terminar
     return embeddings
 
 @st.cache_resource
