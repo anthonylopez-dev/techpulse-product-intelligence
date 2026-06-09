@@ -171,7 +171,7 @@ _state = {
 }
 
 def get_state():
-    """Carga lazy — usa índice lite en producción, completo en local."""
+    """Carga lazy — genera embeddings si no existen."""
     USE_LITE = os.getenv('USE_LITE_INDEX', 'false').lower() == 'true'
 
     if _state['df'] is None:
@@ -185,21 +185,46 @@ def get_state():
     if _state['profiles'] is None:
         _state['profiles'] = pd.read_parquet(PROCESSED / 'cluster_profiles.parquet')
 
-    if _state['embeddings'] is None:
-        emb_file = 'sentence_transformer_embeddings_lite.npy' if USE_LITE \
-                   else 'sentence_transformer_embeddings.npy'
-        emb_path = MODELS / emb_file
-        if emb_path.exists():
-            _state['embeddings'] = np.load(str(emb_path))
-        else:
-            raise HTTPException(
-                status_code=503,
-                detail="Embeddings not found. Run build_lite_index.py first."
-            )
-
     if _state['model'] is None:
         from sentence_transformers import SentenceTransformer
         _state['model'] = SentenceTransformer('all-MiniLM-L6-v2')
+
+    if _state['embeddings'] is None:
+        USE_LITE = os.getenv('USE_LITE_INDEX', 'false').lower() == 'true'
+        emb_file = 'sentence_transformer_embeddings_lite.npy' if USE_LITE \
+                   else 'sentence_transformer_embeddings.npy'
+        emb_path = MODELS / emb_file
+
+        if emb_path.exists():
+            _state['embeddings'] = np.load(str(emb_path))
+        else:
+            # Generar embeddings en runtime
+            df = _state['df']
+
+            def build_text(row):
+                parts = []
+                for col in ['name', 'tagline', 'description']:
+                    val = str(row.get(col, ''))
+                    if val not in ('', 'nan', 'None'):
+                        parts.append(val.strip())
+                return ' | '.join(parts)
+
+            texts = df.apply(build_text, axis=1).tolist()
+            embeddings = _state['model'].encode(
+                texts,
+                batch_size=128,
+                show_progress_bar=False,
+                normalize_embeddings=True
+            )
+
+            # Intentar guardar
+            try:
+                MODELS.mkdir(parents=True, exist_ok=True)
+                np.save(str(emb_path), embeddings)
+            except Exception:
+                pass
+
+            _state['embeddings'] = embeddings
 
     return _state
 
