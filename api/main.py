@@ -18,6 +18,9 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from datetime import datetime
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
+import pickle
 import warnings
 import os
 
@@ -171,7 +174,7 @@ _state = {
 }
 
 def get_state():
-    """Carga lazy — genera embeddings si no existen."""
+    """Carga lazy — usa TF-IDF para producción (liviano) o ST si hay embeddings."""
     USE_LITE = os.getenv('USE_LITE_INDEX', 'false').lower() == 'true'
 
     if _state['df'] is None:
@@ -185,10 +188,6 @@ def get_state():
     if _state['profiles'] is None:
         _state['profiles'] = pd.read_parquet(PROCESSED / 'cluster_profiles.parquet')
 
-    if _state['model'] is None:
-        from sentence_transformers import SentenceTransformer
-        _state['model'] = SentenceTransformer('all-MiniLM-L6-v2')
-
     if _state['embeddings'] is None:
         USE_LITE = os.getenv('USE_LITE_INDEX', 'false').lower() == 'true'
         emb_file = 'sentence_transformer_embeddings_lite.npy' if USE_LITE \
@@ -196,9 +195,11 @@ def get_state():
         emb_path = MODELS / emb_file
 
         if emb_path.exists():
+            # Usar embeddings pre-computados si existen
             _state['embeddings'] = np.load(str(emb_path))
+            _state['use_tfidf']  = False
         else:
-            # Generar embeddings en runtime
+            # Fallback: TF-IDF (liviano, funciona en 512MB)
             df = _state['df']
 
             def build_text(row):
@@ -207,36 +208,31 @@ def get_state():
                     val = str(row.get(col, ''))
                     if val not in ('', 'nan', 'None'):
                         parts.append(val.strip())
-                return ' | '.join(parts)
+                return ' '.join(parts)
 
             texts = df.apply(build_text, axis=1).tolist()
-            embeddings = _state['model'].encode(
-                texts,
-                batch_size=128,
-                show_progress_bar=False,
-                normalize_embeddings=True
+
+            vectorizer = TfidfVectorizer(
+                max_features=8000,
+                min_df=2,
+                max_df=0.85,
+                ngram_range=(1, 2),
+                stop_words='english',
+                sublinear_tf=True,
             )
+            tfidf_matrix = vectorizer.fit_transform(texts)
+            embeddings   = normalize(tfidf_matrix, norm='l2')
 
-            # Intentar guardar
-            try:
-                MODELS.mkdir(parents=True, exist_ok=True)
-                np.save(str(emb_path), embeddings)
-            except Exception:
-                pass
-
-            _state['embeddings'] = embeddings
+            _state['embeddings']  = embeddings
+            _state['vectorizer']  = vectorizer
+            _state['use_tfidf']   = True
 
     return _state
 
 # ── Endpoints ─────────────────────────────────────────────
 
-@app.get(
-    "/health",
-    response_model=HealthResponse,
-    tags=["System"],
-    summary="Health check",
-    description="Returns the current status of the API and loaded resources."
-)
+@app.get("/health", response_model=HealthResponse, tags=["System"],
+         summary="Health check")
 def health_check():
     try:
         state = get_state()
@@ -246,7 +242,7 @@ def health_check():
             timestamp=datetime.utcnow().isoformat(),
             data_loaded=True,
             products_indexed=len(state['df']),
-            embedding_dimensions=state['embeddings'].shape[1],
+            embedding_dimensions=int(state['embeddings'].shape[1]),
         )
     except Exception as e:
         return HealthResponse(
@@ -357,31 +353,20 @@ def get_clusters():
         for _, row in profiles.sort_values('avg_votes', ascending=False).iterrows()
     ]
 
-@app.post(
-    "/recommend/query",
-    response_model=RecommendationResponse,
-    tags=["Recommendations"],
-    summary="Recommend products by free-text query",
-    description="""
+@app.post("/recommend/query", response_model=RecommendationResponse,
+          tags=["Recommendations"],
+          summary="Recommend products by free-text query",
+          description="""
 **Mode A** of the hybrid recommendation engine.
 
-Accepts a natural language description of what you are looking for and returns
-the most semantically similar products using **Sentence Transformers (all-MiniLM-L6-v2)**
-and cosine similarity over 384-dimensional embeddings.
+Accepts a natural language description and returns semantically similar products.
+Uses Sentence Transformers when available, TF-IDF cosine similarity as fallback.
 
 ### Examples
 - `"AI tool to write and edit content automatically"`
 - `"open source design system for developers"`
 - `"app to manage personal finances and budget"`
-- `"project management tool for remote teams"`
-
-### How it works
-1. The query is encoded into a 384-dimensional semantic vector
-2. Cosine similarity is computed against all indexed product embeddings
-3. Results are ranked by similarity score and filtered by optional constraints
-    """,
-    response_description="Ranked list of recommended products with similarity scores"
-)
+          """)
 def recommend_by_query(request: QueryRequest):
     import time
     start = time.time()
@@ -389,29 +374,35 @@ def recommend_by_query(request: QueryRequest):
     state      = get_state()
     df         = state['df']
     embeddings = state['embeddings']
-    model      = state['model']
+    use_tfidf  = state.get('use_tfidf', False)
 
     cluster_col = 'cluster_name' if 'cluster_name' in df.columns else 'cluster'
-
-    # Embedding de la query
-    query_emb = model.encode([request.query], normalize_embeddings=True)
 
     # Filtros
     mask = df['votes'] >= request.min_votes
     if request.cluster_filter:
         mask = mask & (df[cluster_col] == request.cluster_filter)
 
-    filtered_idx  = df[mask].index.tolist()
+    filtered_idx = df[mask].index.tolist()
     if not filtered_idx:
-        raise HTTPException(status_code=404, detail="No products found with the given filters.")
+        raise HTTPException(status_code=404,
+                            detail="No products found with the given filters.")
 
-    filtered_embs = embeddings[filtered_idx]
-    scores        = cosine_similarity(query_emb, filtered_embs)[0]
-    top_idx       = scores.argsort()[-request.top_n:][::-1]
+    if use_tfidf:
+        vectorizer   = state['vectorizer']
+        query_vec    = vectorizer.transform([request.query])
+        query_vec    = normalize(query_vec, norm='l2')
+        filtered_embs = embeddings[filtered_idx]
+        scores        = cosine_similarity(query_vec, filtered_embs)[0]
+    else:
+        model         = state['model']
+        query_emb     = model.encode([request.query], normalize_embeddings=True)
+        filtered_embs = embeddings[filtered_idx]
+        scores        = cosine_similarity(query_emb, filtered_embs)[0]
 
+    top_idx = scores.argsort()[-request.top_n:][::-1]
     results = df.iloc[[filtered_idx[i] for i in top_idx]].copy()
     results['similarity_score'] = scores[top_idx].round(4)
-
     elapsed = (time.time() - start) * 1000
 
     return RecommendationResponse(
@@ -421,8 +412,9 @@ def recommend_by_query(request: QueryRequest):
             ProductResult(
                 rank=i+1,
                 name=str(row['name']),
-                tagline=str(row.get('tagline', '')) if str(row.get('tagline', '')) not in ('nan', 'None', '') else None,
-                cluster_name=str(row.get(cluster_col, '')),
+                tagline=str(row.get('tagline','')) if str(row.get('tagline',''))
+                        not in ('nan','None','') else None,
+                cluster_name=str(row.get(cluster_col,'')),
                 votes=int(row['votes']),
                 year=int(row['year']) if pd.notna(row.get('year')) else 0,
                 similarity_score=float(row['similarity_score']),
@@ -432,29 +424,19 @@ def recommend_by_query(request: QueryRequest):
         processing_time_ms=round(elapsed, 2),
     )
 
-@app.post(
-    "/recommend/similar",
-    response_model=SimilarResponse,
-    tags=["Recommendations"],
-    summary="Find similar products by reference product name",
-    description="""
+@app.post("/recommend/similar", response_model=SimilarResponse,
+          tags=["Recommendations"],
+          summary="Find similar products by reference product name",
+          description="""
 **Mode B** of the hybrid recommendation engine.
 
-Given a reference product name, finds the most semantically similar products
-using pre-computed **Sentence Transformer embeddings** and cosine similarity.
+Given a reference product name, finds the most semantically similar products.
 
 ### Examples
 - `"Notion"` → productivity and template tools
 - `"Figma"` → design and collaboration tools
 - `"ChatGPT"` → AI and browser extension tools
-
-### How it works
-1. The reference product is located in the index (highest-voted match if multiple)
-2. Its embedding vector is used as the search query
-3. Results are ranked by cosine similarity, excluding the reference product itself
-    """,
-    response_description="Ranked list of similar products with similarity scores"
-)
+          """)
 def recommend_similar(request: SimilarRequest):
     import time
     start = time.time()
@@ -462,47 +444,47 @@ def recommend_similar(request: SimilarRequest):
     state      = get_state()
     df         = state['df']
     embeddings = state['embeddings']
+    use_tfidf  = state.get('use_tfidf', False)
 
     cluster_col = 'cluster_name' if 'cluster_name' in df.columns else 'cluster'
 
-    # Buscar producto de referencia
     matches = df[df['name'].str.lower().str.contains(
         request.product_name.lower(), na=False)]
 
     if len(matches) == 0:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Product '{request.product_name}' not found in the index."
-        )
+        raise HTTPException(status_code=404,
+                            detail=f"Product '{request.product_name}' not found.")
 
     ref     = matches.loc[matches['votes'].idxmax()]
     ref_idx = ref.name
-    ref_emb = embeddings[ref_idx].reshape(1, -1)
+    mask    = df.index != ref_idx
 
-    # Excluir el producto mismo
-    mask          = df.index != ref_idx
     filtered_idx  = df[mask].index.tolist()
     filtered_embs = embeddings[filtered_idx]
+    ref_emb       = embeddings[ref_idx]
 
-    scores  = cosine_similarity(ref_emb, filtered_embs)[0]
+    if use_tfidf:
+        scores = cosine_similarity(ref_emb, filtered_embs)[0]
+    else:
+        scores = cosine_similarity(ref_emb.reshape(1,-1), filtered_embs)[0]
+
     top_idx = scores.argsort()[-request.top_n:][::-1]
-
     results = df.iloc[[filtered_idx[i] for i in top_idx]].copy()
     results['similarity_score'] = scores[top_idx].round(4)
-
     elapsed = (time.time() - start) * 1000
 
     return SimilarResponse(
         reference_product=str(ref['name']),
-        reference_cluster=str(ref.get(cluster_col, '')),
+        reference_cluster=str(ref.get(cluster_col,'')),
         reference_votes=int(ref['votes']),
         total_results=len(results),
         results=[
             ProductResult(
                 rank=i+1,
                 name=str(row['name']),
-                tagline=str(row.get('tagline', '')) if str(row.get('tagline', '')) not in ('nan', 'None', '') else None,
-                cluster_name=str(row.get(cluster_col, '')),
+                tagline=str(row.get('tagline','')) if str(row.get('tagline',''))
+                        not in ('nan','None','') else None,
+                cluster_name=str(row.get(cluster_col,'')),
                 votes=int(row['votes']),
                 year=int(row['year']) if pd.notna(row.get('year')) else 0,
                 similarity_score=float(row['similarity_score']),
